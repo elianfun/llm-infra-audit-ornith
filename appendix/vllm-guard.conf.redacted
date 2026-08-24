@@ -1,0 +1,17 @@
+# 來源: /home/vghks7/vllm-guard.conf (172.17.161.28)，2026-08-24 稽核取得
+# API_KEY 已遮蔽
+
+# Ornith 397B(vLLM 雙機 torch-distributed,兩個節點都有 vllm serve)
+MODEL=ornith
+PORT=8000
+API_KEY=[REDACTED]
+WORKER_IP=10.0.0.2
+RECIPE=recipes/ornith-397b-w4a16-phase1.yaml
+MOUNT=/var/tmp/ornith-models
+RAY_ARGS=--no-ray
+NODES=10.0.0.1,10.0.0.2
+EXTRA_ARGS=""
+CHECK_TIMEOUT=120
+# 並發 8 時排隊可能超過 120 秒 → 給 4 次(8 分鐘)才動手,避免誤殺正常服務
+FAIL_THRESHOLD=4
+READY_TRIES=60

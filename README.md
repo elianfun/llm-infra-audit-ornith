@@ -194,14 +194,16 @@ vLLM 部署工具，不是從零手刻的腳本。**要在新機器上還原，�
   `docker logs vllm_node` 在兩節點皆為空（因為 `vllm serve` 不是容器主行程，見第 9 節），
   找不到 08-17 這次啟動的任何 log 可交叉比對。
 
-**結論**：07-21 有明確證據顯示官方自動化路徑運作正常；但 08-17 這次（目前線上運行的版本）
-很可能是**繞過 `launch-cluster.sh`/`run-recipe.sh` 的手動重啟**（例如直接在兩台個別
-`docker exec` 執行同一行指令），導致兩節點命令列意外重複。服務目前仍正常回應（GPU 已載入
-權重、閒置低功耗、API 回 401 而非連線失敗），**但無法排除這是一個「表面正常、實際上兩個
-rank-0 各自獨立運作」的隱性故障**——例如查詢剛好都落在 head，worker 那份權重從未真的被用到。
-**強烈建議**：用第 10 節「還原步驟」的官方路徑（`run-recipe.sh ... -n <IP1>,<IP2> -d`）
-重新啟動一次，讓 log 走回可追蹤的路徑，並確認 `docker logs`/`journalctl` 能看到
-`rank 1`/`--headless` 字樣。
+**結論**：07-21 有明確證據顯示官方自動化路徑運作正常；`vllm-guard.conf`（[`appendix/`](./appendix/)）
+更直接證實看門狗每次自動重啟都是呼叫 `./run-recipe.sh recipes/ornith-397b-w4a16-phase1.yaml
+--no-ray -n 10.0.0.1,10.0.0.2 -d`——這條路徑會正確產生 `rank 1 --headless`。所以 08-17
+這次（目前線上運行、兩節點命令列逐字相同都是 rank 0 的版本）**很可能是繞過看門狗與
+`run-recipe.sh` 的手動重啟**（例如直接在兩台個別 `docker exec` 執行同一行指令），
+導致兩節點命令列意外重複。服務目前仍正常回應（GPU 已載入權重、閒置低功耗、API 回 401
+而非連線失敗），**但無法排除這是一個「表面正常、實際上兩個 rank-0 各自獨立運作」的隱性
+故障**——例如查詢剛好都落在 head，worker 那份權重從未真的被用到。
+**強烈建議**：用第 10 節「還原步驟」的官方路徑重新啟動一次，讓 log 走回可追蹤的路徑，
+並確認 `docker logs`/`journalctl` 能看到 `rank 1`/`--headless` 字樣。
 
 ---
 
@@ -374,9 +376,17 @@ appendix/
   ornith-generation_config.json                      generation_config.json 原始備份
   ornith-397b-w4a16-phase1.redacted.yaml             實際使用的部署 recipe（API key 已遮蔽）
   vllm-guard.sh                                       開機自啟/健康檢查看門狗腳本原始備份
+  vllm-guard.conf.redacted                             看門狗設定檔（API key 已遮蔽，含 NODES/RAY_ARGS 等關鍵參數）
   crontab-host1.txt                                   Host A 的 crontab 原始備份
   observed-live-launch-commands.redacted.txt          稽核當下擷取到的完整執行中指令列（含異常記錄）
+  chat_template_fixed.jinja                            模型使用的自訂 chat template 原始備份
+  ornith-tokenizer_config.json                         tokenizer 設定原始備份
+  ornith-preprocessor_config.json                       圖片前處理設定原始備份
+  ornith-processor_config.json                          processor 設定原始備份
 ```
+
+`spark-vllm-docker/.env`（工具鏈的網路/節點快取設定檔）**不存在**——確認這套部署每次啟動都是
+用 `-n <IPs>` 明確帶入節點清單、即時 auto-detect 網卡，而不是靠一份快取設定檔，還原時無需找這個檔案。
 
 ## 13. 方法論
 
