@@ -1,0 +1,55 @@
+# Recipe: Ornith-1.0-397B-W4A16 (Phase 1 — 無投機解碼)
+# 基於官方 qwen3.5-397b-int4-autoround.yaml 改寫（Ornith 是 Qwen3.5-397B 微調版）
+# 模型已在本機 /home/vghks15/models（容器內掛載為 /models），不需下載
+# 啟動需設: export VLLM_SPARK_EXTRA_DOCKER_ARGS="-v $HOME/models:/models"
+# 記憶體注意: gpu_memory_utilization 單位是 GB（gpu-mem-util-gb mod）。
+#   官方配方用 108GB（headless 前提）; 本機有 GNOME 桌面, 先用 103GB 保守值。
+# 若節點無預警關機: sudo nvidia-smi -lgc 200,2150
+#
+# [此檔案為稽核時取得的複本，API key 已遮蔽]
+# 來源: /home/vghks7/spark-vllm-docker/recipes/ornith-397b-w4a16-phase1.yaml (172.17.161.28)
+
+recipe_version: "1"
+name: Ornith-397B-W4A16-Phase1
+description: Ornith-1.0-397B W4A16 on 2x GB10, no speculative decoding
+
+cluster_only: true
+container: vllm-node
+
+mods:
+  - mods/gpu-mem-util-gb
+  - mods/kv-cache-prealloc-cleanup
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 103
+  kv_cache_memory_bytes: 4294967296
+  max_model_len: 131072
+  max_num_batched_tokens: 4176
+
+env:
+  VLLM_MARLIN_USE_ATOMIC_ADD: 1
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: 0
+
+command: |
+  vllm serve /models/Ornith-1.0-397B-W4A16-AutoRound \
+    --served-model-name ornith \
+    --max-model-len {max_model_len} \
+    --max-num-seqs 8 \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization-gb {gpu_memory_utilization} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --port {port} \
+    --host {host} \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    --load-format instanttensor \
+    --api-key sk-ornith-************************** \
+    --chat-template /models/chat_template_fixed.jinja \
+    -tp {tensor_parallel}

@@ -1,0 +1,6 @@
+# 來源: crontab -l @ vghks7@172.17.161.28 (2026-08-24 稽核時擷取)
+
+# vLLM 叢集守護(2026-08-05 加):開機自啟 + 每 2 分鐘健康檢查
+# 維護前先 touch /home/vghks7/.vllm-guard-off,做完記得刪掉
+@reboot sleep 30 && /bin/bash /home/vghks7/vllm-guard.sh boot
+*/2 * * * * /bin/bash /home/vghks7/vllm-guard.sh check

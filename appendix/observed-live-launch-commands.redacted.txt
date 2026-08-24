@@ -1,0 +1,39 @@
+實際擷取的執行中 process 完整命令列（2026-08-24，`ps -eo args ww` 未截斷取得）
+API key 已遮蔽。此為「實際觀測結果」，並非推導值 —— 保留原樣供除錯參考。
+
+──────────────────────────────────────────────
+Host1 172.17.161.28 (vghks7 / edgexpert-542a)  ETH_IF=enp1s0f0np0  LOCAL 10.0.0.1
+──────────────────────────────────────────────
+/usr/bin/python3 /usr/local/bin/vllm serve /models/Ornith-1.0-397B-W4A16-AutoRound \
+  --served-model-name ornith --max-model-len 131072 --max-num-seqs 8 \
+  --kv-cache-dtype fp8 --gpu-memory-utilization-gb 103 \
+  --kv-cache-memory-bytes 4294967296 --port 8000 --host 0.0.0.0 \
+  --enable-prefix-caching --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+  --reasoning-parser qwen3 --max-num-batched-tokens 4176 --trust-remote-code \
+  --load-format instanttensor \
+  --api-key sk-ornith-************************** \
+  --chat-template /models/chat_template_fixed.jinja \
+  -tp 2 --nnodes 2 --node-rank 0 --master-addr 10.0.0.1 --master-port 29501
+
+──────────────────────────────────────────────
+Host2 172.17.161.30 (vghks15 / edgexpert-0d4a)  worker
+──────────────────────────────────────────────
+/usr/bin/python3 /usr/local/bin/vllm serve /models/Ornith-1.0-397B-W4A16-AutoRound \
+  --served-model-name ornith --max-model-len 131072 --max-num-seqs 8 \
+  --kv-cache-dtype fp8 --gpu-memory-utilization-gb 103 \
+  --kv-cache-memory-bytes 4294967296 --port 8000 --host 0.0.0.0 \
+  --enable-prefix-caching --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+  --reasoning-parser qwen3 --max-num-batched-tokens 4176 --trust-remote-code \
+  --load-format instanttensor \
+  --api-key sk-ornith-************************** \
+  --chat-template /models/chat_template_fixed.jinja \
+  -tp 2 --nnodes 2 --node-rank 0 --master-addr 10.0.0.1 --master-port 29501
+
+⚠️ 注意：兩邊命令列逐字相同，皆為 --node-rank 0，且都沒有 --headless。
+依 spark-vllm-docker/launch-cluster.sh 原始邏輯（見 README.md 主文說明），worker
+理應會被自動改寫成 --node-rank 1 --headless。兩節點命令完全一致，代表這次啟動
+「並未」走過 launch-cluster.sh 的 exec_no_ray_cluster() 自動改寫路徑（例如改為
+手動在兩台分別執行相同指令，或用了其他啟動路徑），確切機制未能從唯讀稽核確認。
+還原此架構時請勿照抄「兩邊都打 --node-rank 0」，應遵循 README.md 中列出的
+run-recipe.sh / launch-cluster.sh 官方多節點啟動方式，讓 worker 正確拿到
+--node-rank 1 --headless。
