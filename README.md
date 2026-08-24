@@ -155,6 +155,87 @@ DGX OS / Spark 專屬 apt source（機器出廠或跑過官方 setup 腳本才�
 
 ---
 
+## 4a. Docker 容器內部完整解剖
+
+`docker inspect` + `docker history` + `docker exec` 逐層拆解 `vllm-node:latest` image（兩節點一致）：
+
+### Image 建置系譜
+
+```
+ubuntu:24.04（官方 base）
+  └─ nvidia/cuda:13.0.2-devel-ubuntu24.04（NVIDIA 官方 CUDA devel image，NVARCH=sbsa 即 ARM 伺服器版）
+       └─ + libcudnn9-cuda-13、cuda-*-dev-13-0 全套 CUDA 開發工具鏈（含 nsight-compute，非僅 runtime）
+       └─ + apt: python3/pip/dev、vim、curl、git、wget、libibverbs1/dev、rdma-core、libxcb1、earlyoom
+       └─ + 本地 .deb 套件覆蓋安裝 NCCL 2.28.3（/workspace/nccl-pkg/*.deb，覆蓋掉 pip 版 libnccl.so.2，
+           改連結到 apt 版 —— 這步是 RDMA/RoCE 能正常運作的關鍵，pip 版 NCCL 通常沒編譯 RDMA transport）
+       └─ + uv pip: torch==2.11.0 生態系（torchvision/torchaudio/triton）@ PyTorch cu130 index
+       └─ + uv pip install /workspace/wheels/*.whl（**自建的 vLLM wheel**，見下方 build-metadata）
+       └─ + uv pip: ray[default]、fastsafetensors、instanttensor（build 完後 wheels/ 已清空，不留在最終 image）
+       └─ + 預先下載 tiktoken 編碼檔（o200k_base / cl100k_base，離線環境用）
+```
+
+### 精確建置版本（`/workspace/build-metadata.yaml`，可用來重新 checkout 完全相同版本）
+
+```yaml
+build_date: 2026-07-11T17:58:48Z
+vllm_version: 0.23.1rc1.dev1043+ga4b4b5787.d20260711
+vllm_commit: a4b4b57872da31bf82291a04e04908f576bdc529
+flashinfer_commit: 1aca0f887b65f2ba2bc5e9e9d35ff0bd078da76d
+gpu_arch: 12.1a          # Blackwell sm_121a，GB10 專屬 compute capability
+build_args:
+  vllm_ref: main
+  transformers_5: true
+```
+
+### 容器內部關鍵事實
+
+| 項目 | 值 |
+|---|---|
+| Base OS（容器內） | Ubuntu 24.04.3 LTS（跟 host 的 24.04.4 差一個小版號，正常） |
+| Python | 3.12.3，套件管理用 `uv`（非純 pip，`UV_SYSTEM_PYTHON=1` 直接裝進系統環境） |
+| 原始 `ENTRYPOINT` | `/opt/nvidia/nvidia_entrypoint.sh`（NVIDIA 官方 CUDA image 標準 entrypoint，`launch-cluster.sh` 用 `--entrypoint=` 清空它，改跑 `sleep infinity`） |
+| 原始 `WORKDIR` | `/workspace/vllm` |
+| pip 套件總數 | **215 個**（完整清單見 [`appendix/container-pip-freeze.txt`](./appendix/container-pip-freeze.txt)） |
+| `/workspace/` 內容 | `vllm/`（原始碼樹）、`mods/`（見第 7 節補丁）、`build-metadata.yaml`、`exec-script.sh`（見下方） |
+
+### 幾個容易被忽略、但決定「能不能跑」的關鍵套件
+
+| 套件 | 版本 | 為什麼重要 |
+|---|---|---|
+| `instanttensor` | 0.1.9 | 就是 `--load-format instanttensor` 的來源，**PyPI/自建 wheel 可安裝的真實套件**，不是 vLLM 內建功能 |
+| `fastsafetensors` | 0.3.3 | GPU Direct Storage 式的 safetensors 快速載入，配合 instanttensor 加速 397B 模型讀取 |
+| `nvidia-nvshmem-cu13` | 3.4.5 | NVSHMEM，NVIDIA 的 GPU 間共享記憶體通訊庫，多節點 kernel 級通訊會用到 |
+| `ray` | 2.56.0 | **已安裝但本部署未啟用**（`RAY_ARGS=--no-ray`）；image 同時支援 Ray 模式與純 torch.distributed 模式，靠 recipe/CLI flag 切換 |
+| `triton` | 3.6.0 | flashinfer/vLLM 的 JIT kernel 編譯後端 |
+| `tilelang` | 0.1.9 | 另一套 GPU kernel DSL/編譯器（配合 `~/.tilelang` cache 掛載） |
+| `apache-tvm-ffi` | 0.1.9 | TVM FFI，供上述 JIT 編譯生態系互通用 |
+
+### `/workspace/exec-script.sh`：真正被執行的那份腳本（關鍵新證據）
+
+這個檔案是 `launch-cluster.sh` 在 `--launch-script`（recipe 模式）下，把 recipe 渲染出的指令
+`docker cp` 進容器的最終產物，**兩節點分別各自的版本**應該要被 `make_node_script()` 依節點
+角色改寫成不同的 `--node-rank`。實際抓下來比對：
+
+```diff
+Host A (head)   ends with: -tp 2 --nnodes 2 --node-rank 0 --master-addr 10.0.0.1 --master-port 29501
+Host B (worker) ends with: -tp 2 --nnodes 2 --node-rank 0 --master-addr 10.0.0.1 --master-port 29501
+                                              ^^^^^^^^^^^^ 完全相同,理論上應為 --node-rank 1 --headless
+```
+
+**兩節點的 `exec-script.sh` 逐位元組相同**（已用 `docker exec ... cat` 直接讀容器內檔案，非
+`ps` 截斷）。這推翻了先前「可能是人工繞過工具鏈手動重啟」的猜測 —— 檔案標頭清楚寫著
+`# Generated from recipe: Ornith-397B-W4A16-Phase1`，且路徑正是 `launch-cluster.sh` 自動化流程
+會寫入的 `/workspace/exec-script.sh`，代表**這就是自動化流程本身產生的檔案**。真正的問題出在
+`make_node_script()` 幫 worker 節點差異化 `--node-rank`/`--headless` 這一步，在這次（以及
+7/21 那次，日誌雖然印出「rank 1」但那只是迴圈變數的 echo，並未驗證實際寫入檔案的內容）並未正確生效，
+研判是這版工具鏈在「透過 recipe 啟動的多節點 no-Ray 模式」下的一個潛在 bug，而非人為疏失。
+服務仍運作正常，可能的解釋包括：vLLM 較新版本本身有额外的 rank 自動協商機制、或是兩個「rank 0」
+行程中有一個實際上是以未定義行為 fallback 運作。**這是還原此架構時最值得回報給
+`eugr/spark-vllm-docker` 專案的一個發現**，建議還原新環境時實際測試多節點啟動後，務必用
+`docker exec vllm_node cat /workspace/exec-script.sh` 在兩節點分別確認產生的檔案內容確實不同。
+
+---
+
 ## 5. 部署工具鏈：`spark-vllm-docker`
 
 實機上（`/home/vghks7/spark-vllm-docker`，`git remote origin` 指向
@@ -178,32 +259,25 @@ vLLM 部署工具，不是從零手刻的腳本。**要在新機器上還原，�
 - 掛載：`~/.cache/huggingface`、`~/.cache/vllm`、`~/.cache/flashinfer`、`~/.triton`、`~/.tilelang`；模型目錄另用 `VLLM_SPARK_EXTRA_DOCKER_ARGS="-v <模型目錄>:/models"` 掛入
 - 實際的 `vllm serve ...` 指令是另外用 `docker exec` 常駐執行（**不是**容器 CMD），這是刻意設計 —— 原因見第 9 節看門狗說明
 
-### Rank 分派時間軸：確認過正常運作，但目前運行中的實例有異常
+### Rank 分派異常：完整證據鏈與修正後的結論
 
-- **2026-07-21（`397b-launch5.log`，已確認的正常部署紀錄）**：
-  ```
-  Launching worker (rank 1) on 10.0.0.2...
-  Executing command on head node (rank 0): /workspace/exec-script.sh
-  ```
-  這證實 `launch-cluster.sh` 的自動 per-node rank 分派**當時是正確運作的**（head=10.0.0.1
-  rank 0，worker=10.0.0.2 rank 1，worker 有拿到對應的 `--headless`），也確認了 Host B 的
-  RDMA IP 就是 `10.0.0.2`。
-- **2026-08-24（本次稽核，`ps -eo args ww` 未截斷擷取，目前運行中的容器已連續運行 7 天，
-  推算約 08-17 啟動）**：兩節點的**完整命令列逐字相同**，都是 `--node-rank 0`、都沒有
-  `--headless`（見 [`appendix/observed-live-launch-commands.redacted.txt`](./appendix/observed-live-launch-commands.redacted.txt)）。
-  `docker logs vllm_node` 在兩節點皆為空（因為 `vllm serve` 不是容器主行程，見第 9 節），
-  找不到 08-17 這次啟動的任何 log 可交叉比對。
+第 4a 節已透過直接讀取兩節點容器內 `/workspace/exec-script.sh`（比 `ps` 截斷擷取更權威的證據）
+確認：**這確實是自動化工具鏈本身產生並複製的檔案，不是人為手動繞過**，但 worker 節點該有的
+`--node-rank 1 --headless` 差異化沒有生效，兩節點檔案逐位元組相同。時間軸佐證：
 
-**結論**：07-21 有明確證據顯示官方自動化路徑運作正常；`vllm-guard.conf`（[`appendix/`](./appendix/)）
-更直接證實看門狗每次自動重啟都是呼叫 `./run-recipe.sh recipes/ornith-397b-w4a16-phase1.yaml
---no-ray -n 10.0.0.1,10.0.0.2 -d`——這條路徑會正確產生 `rank 1 --headless`。所以 08-17
-這次（目前線上運行、兩節點命令列逐字相同都是 rank 0 的版本）**很可能是繞過看門狗與
-`run-recipe.sh` 的手動重啟**（例如直接在兩台個別 `docker exec` 執行同一行指令），
-導致兩節點命令列意外重複。服務目前仍正常回應（GPU 已載入權重、閒置低功耗、API 回 401
-而非連線失敗），**但無法排除這是一個「表面正常、實際上兩個 rank-0 各自獨立運作」的隱性
-故障**——例如查詢剛好都落在 head，worker 那份權重從未真的被用到。
-**強烈建議**：用第 10 節「還原步驟」的官方路徑重新啟動一次，讓 log 走回可追蹤的路徑，
-並確認 `docker logs`/`journalctl` 能看到 `rank 1`/`--headless` 字樣。
+- **2026-07-21（`397b-launch5.log`）**：日誌印出 `Launching worker (rank 1) on 10.0.0.2...`，
+  但這只是 shell 迴圈變數的 echo，**並未證明實際寫入 worker 容器的腳本內容也是 rank 1**
+  （當時沒有留存 exec-script.sh 可回溯比對）。
+- **2026-08-24（本次稽核）**：直接讀到兩節點現存的 `exec-script.sh`，逐位元組相同，皆為
+  `--node-rank 0`、無 `--headless`。
+
+**結論（已修正先前「可能是人工手動重啟」的猜測）**：這是 `launch-cluster.sh` 在「recipe +
+no-Ray 多節點」路徑下 `make_node_script()` 差異化邏輯的疑似 bug，兩次（07-21 與這次運行中的
+08-17）啟動可能都受影響，只是 07-21 沒留下檔案可驗證。服務目前仍正常回應（GPU 已載入權重、
+閒置低功耗、API 回 401 而非連線失敗），但無法排除「兩個 rank 0 各自獨立運作、worker 那份
+權重從未真的被用於查詢」的隱性風險。**強烈建議**：用第 10 節「還原步驟」重新啟動一次，
+並用 `docker exec vllm_node cat /workspace/exec-script.sh` 在兩節點分別確認產生的檔案內容
+確實不同，若仍相同，建議回報給 [`eugr/spark-vllm-docker`](https://github.com/eugr/spark-vllm-docker) 專案。
 
 ---
 
@@ -383,6 +457,7 @@ appendix/
   ornith-tokenizer_config.json                         tokenizer 設定原始備份
   ornith-preprocessor_config.json                       圖片前處理設定原始備份
   ornith-processor_config.json                          processor 設定原始備份
+  container-pip-freeze.txt                              容器內完整 215 個 pip 套件版本清單
 ```
 
 `spark-vllm-docker/.env`（工具鏈的網路/節點快取設定檔）**不存在**——確認這套部署每次啟動都是
